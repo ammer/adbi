@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <errno.h>       
 #include <sys/mman.h>
+#include <assert.h>
 
 int debug = 0;
 int zygote = 0;
@@ -531,6 +532,7 @@ read_mem(pid_t pid, unsigned long *buf, int nlong, unsigned long pos)
 	return 0;
 }
 
+#if 0
 unsigned int sc_old[] = {
 // libname
 0xe59f0030, // ldr     r0, [pc, #48] | addr of "libname" in r0
@@ -573,9 +575,11 @@ unsigned int sc[] = {
 0xe1a00000, //        nop                     addr of libname
 0xe1a00000, //        nop                     dlopenaddr
 };
+#endif
 
+#ifdef __arm__
 struct pt_regs2 {
-         long uregs[18];
+  long uregs[18];
 };
 
 #define ARM_cpsr        uregs[16]
@@ -596,6 +600,112 @@ struct pt_regs2 {
 #define ARM_r1          uregs[1]
 #define ARM_r0          uregs[0]
 #define ARM_ORIG_r0     uregs[17]
+
+struct pt_arm_regs {
+  long uregs[18];
+};
+
+__asm__(
+	".section .data   \n"
+	".global arm_asm_end, arm_asm_start, stored_arm_regs, arm_libdl_path \n"
+
+	"arm_asm_start:   \n"
+	//	" ldr r0, [pc, #(arm_libdl_path-arm_asm_start-8)]; " /* library filename */
+	" add r0, pc, #(arm_libdl_path-arm_asm_start-8); " /* library filename */
+	" mov r1, #0;       "	/* flag */
+	" mov lr, pc;       "	/* return address */
+	" ldr pc, [pc, #(arm_dlopen_addr-arm_asm_start-20)]; " /* dlopen address */
+
+	" ldr r0, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+	" ldr r1, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+	" ldr r2, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+	" ldr r3, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+	" ldr sp, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+	" ldr lr, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+	" ldr pc, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+
+	"arm_dlopen_addr: \n"
+	" .int 0          \n"
+
+	"stored_arm_regs: \n"
+	" .fill 7, 4, 0   \n"	/* 7 registers */
+
+	"arm_libdl_path:  \n"
+	" .fill 512, 1, 0 \n"	/* filename */
+
+	"arm_asm_end:     \n"
+	);
+
+void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_arm_regs *regs, void *mprotectaddr) {
+  extern void *arm_asm_start;
+  extern void *arm_asm_end;
+  extern int  *stored_arm_regs;
+  extern void *arm_libdl_path;
+  extern void **arm_dlopen_addr;
+  extern void *arm_libdl_path1;
+
+  if(debug) {
+    printf("remote_dlopen(pid=%d, lib=%s, dlopen=%p, regs=%p, mprotect=%p)\n", 
+	   pid, libname, dlopen_addr, regs, mprotectaddr);
+  }
+
+  int *r = &stored_arm_regs;
+  r[0] = regs->ARM_r0;
+  r[1] = regs->ARM_r1;
+  r[2] = regs->ARM_r2;
+  r[3] = regs->ARM_r3;
+  r[4] = regs->ARM_sp;
+  r[5] = regs->ARM_lr;
+  r[6] = regs->ARM_pc;
+
+  /* library name */
+  strncpy((char *)&arm_libdl_path, libname, 512);
+  /* dlopen address */
+  arm_dlopen_addr = dlopen_addr;
+
+  // write code to stack
+  int sc_size = &arm_asm_end-&arm_asm_start;
+  assert(sc_size == 147);
+
+  void *codeaddr = regs->ARM_sp - (sc_size<<2);
+  if (0 > write_mem(pid, (unsigned long*)&arm_asm_start, sc_size, codeaddr)) {
+    printf("cannot write code, error!\n");
+    exit(1);
+  }
+
+  if (debug)
+    printf("executing injection code at 0x%x\n", codeaddr);
+
+  // calc stack pointer
+  regs->ARM_sp = codeaddr; //regs->ARM_sp - (sc_size<<2);
+  // call mprotect() to make stack executable
+  if(debug) {
+    printf("Modify segment %p~%p to executable\n", stack_start, stack_end);
+  }
+
+  regs->ARM_r0 = stack_start; // want to make stack executable
+  regs->ARM_r1 = stack_end - stack_start; // stack size
+  regs->ARM_r2 = PROT_READ|PROT_WRITE|PROT_EXEC; // protections
+
+  // normal mode, first call mprotect
+  //  if (nomprotect == 0) {
+    if (debug)
+      printf("calling mprotect\n");
+
+    regs->ARM_lr = codeaddr; // points to loading and fixing code
+    regs->ARM_pc = mprotectaddr; // execute mprotect()
+    //  }
+  // no need to execute mprotect on old Android versions
+    //  else {
+    //    regs.ARM_pc = codeaddr; // just execute the 'shellcode'
+    //  }
+
+    // detach and continue
+    ptrace(PTRACE_SETREGS, pid, 0, regs);
+
+}
+
+#endif	/* __arm__ */
 
 #define HELPSTR "error usage: %s -p PID -l LIBNAME [-d (debug on)] [-z (zygote)] [-m (no mprotect)] [-s (appname)] [-Z (trace count)] [-D (debug level)]\n"
 
@@ -791,7 +901,6 @@ int main(int argc, char *argv[])
 	}
 	ptrace(PTRACE_GETREGS, pid, 0, &regs);
 
-
 	// setup variables of the loading and fixup code	
 	/*
 	sc[9] = regs.ARM_r0;
@@ -802,79 +911,82 @@ int main(int argc, char *argv[])
 	sc[15] = dlopenaddr;
 	*/
 	
-	sc[11] = regs.ARM_r0;
-	sc[12] = regs.ARM_r1;
-	sc[13] = regs.ARM_r2;
-	sc[14] = regs.ARM_r3;
-	sc[15] = regs.ARM_lr;
-	sc[16] = regs.ARM_pc;
-	sc[17] = regs.ARM_sp;
-	sc[19] = dlopenaddr;
+	/* sc[11] = regs.ARM_r0; */
+	/* sc[12] = regs.ARM_r1; */
+	/* sc[13] = regs.ARM_r2; */
+	/* sc[14] = regs.ARM_r3; */
+	/* sc[15] = regs.ARM_lr; */
+	/* sc[16] = regs.ARM_pc; */
+	/* sc[17] = regs.ARM_sp; */
+	/* sc[19] = dlopenaddr; */
 		
-	if (debug) {
-		printf("pc=%x lr=%x sp=%x fp=%x\n", regs.ARM_pc, regs.ARM_lr, regs.ARM_sp, regs.ARM_fp);
-		printf("r0=%x r1=%x\n", regs.ARM_r0, regs.ARM_r1);
-		printf("r2=%x r3=%x\n", regs.ARM_r2, regs.ARM_r3);
-	}
+	/* if (debug) { */
+	/* 	printf("pc=%x lr=%x sp=%x fp=%x\n", regs.ARM_pc, regs.ARM_lr, regs.ARM_sp, regs.ARM_fp); */
+	/* 	printf("r0=%x r1=%x\n", regs.ARM_r0, regs.ARM_r1); */
+	/* 	printf("r2=%x r3=%x\n", regs.ARM_r2, regs.ARM_r3); */
+	/* } */
 
-	// push library name to stack
-	libaddr = regs.ARM_sp - n*4 - sizeof(sc);
-	sc[18] = libaddr;	
-	//sc[14] = libaddr;
-	//printf("libaddr: %x\n", libaddr);
+	/* // push library name to stack */
+	/* libaddr = regs.ARM_sp - n*4 - sizeof(sc); */
+	/* sc[18] = libaddr;	 */
+	/* //sc[14] = libaddr; */
+	/* //printf("libaddr: %x\n", libaddr); */
 
-	if (stack_start == 0) {
-		stack_start = (unsigned long int) strtol(argv[3], NULL, 16);
-		stack_start = stack_start << 12;
-		stack_end = stack_start + strtol(argv[4], NULL, 0);
-	}
-	if (debug)
-		printf("stack: 0x%x-0x%x leng = %d\n", stack_start, stack_end, stack_end-stack_start);
+	/* if (stack_start == 0) { */
+	/* 	stack_start = (unsigned long int) strtol(argv[3], NULL, 16); */
+	/* 	stack_start = stack_start << 12; */
+	/* 	stack_end = stack_start + strtol(argv[4], NULL, 0); */
+	/* } */
+	/* if (debug) */
+	/* 	printf("stack: 0x%x-0x%x leng = %d\n", stack_start, stack_end, stack_end-stack_start); */
 	
-	// write library name to stack
-	if (0 > write_mem(pid, (unsigned long*)arg, n, libaddr)) {
-		printf("cannot write library name (%s) to stack, error!\n", arg);
-		exit(1);
-	}
+	/* // write library name to stack */
+	/* if (0 > write_mem(pid, (unsigned long*)arg, n, libaddr)) { */
+	/* 	printf("cannot write library name (%s) to stack, error!\n", arg); */
+	/* 	exit(1); */
+	/* } */
 	
-	// write code to stack
-	codeaddr = regs.ARM_sp - sizeof(sc);
-	if (0 > write_mem(pid, (unsigned long*)&sc, sizeof(sc)/sizeof(long), codeaddr)) {
-		printf("cannot write code, error!\n");
-		exit(1);
-	}
+	/* // write code to stack */
+	/* codeaddr = regs.ARM_sp - sizeof(sc); */
+	/* if (0 > write_mem(pid, (unsigned long*)&sc, sizeof(sc)/sizeof(long), codeaddr)) { */
+	/* 	printf("cannot write code, error!\n"); */
+	/* 	exit(1); */
+	/* } */
 	
-	if (debug)
-		printf("executing injection code at 0x%x\n", codeaddr);
+	/* if (debug) */
+	/* 	printf("executing injection code at 0x%x\n", codeaddr); */
 
-	// calc stack pointer
-	regs.ARM_sp = regs.ARM_sp - n*4 - sizeof(sc);
+	/* // calc stack pointer */
+	/* regs.ARM_sp = regs.ARM_sp - n*4 - sizeof(sc); */
 
-	// call mprotect() to make stack executable
-	regs.ARM_r0 = stack_start; // want to make stack executable
-	//printf("r0 %x\n", regs.ARM_r0);
-	regs.ARM_r1 = stack_end - stack_start; // stack size
-	//printf("mprotect(%x, %d, ALL)\n", regs.ARM_r0, regs.ARM_r1);
-	regs.ARM_r2 = PROT_READ|PROT_WRITE|PROT_EXEC; // protections
+	/* // call mprotect() to make stack executable */
+	/* regs.ARM_r0 = stack_start; // want to make stack executable */
+	/* //printf("r0 %x\n", regs.ARM_r0); */
+	/* regs.ARM_r1 = stack_end - stack_start; // stack size */
+	/* //printf("mprotect(%x, %d, ALL)\n", regs.ARM_r0, regs.ARM_r1); */
+	/* regs.ARM_r2 = PROT_READ|PROT_WRITE|PROT_EXEC; // protections */
 
-	// normal mode, first call mprotect
-	if (nomprotect == 0) {
-		if (debug)
-			printf("calling mprotect\n");
-		regs.ARM_lr = codeaddr; // points to loading and fixing code
-		regs.ARM_pc = mprotectaddr; // execute mprotect()
-	}
-	// no need to execute mprotect on old Android versions
-	else {
-		regs.ARM_pc = codeaddr; // just execute the 'shellcode'
-	}
+	/* // normal mode, first call mprotect */
+	/* if (nomprotect == 0) { */
+	/* 	if (debug) */
+	/* 		printf("calling mprotect\n"); */
+	/* 	regs.ARM_lr = codeaddr; // points to loading and fixing code */
+	/* 	regs.ARM_pc = mprotectaddr; // execute mprotect() */
+	/* } */
+	/* // no need to execute mprotect on old Android versions */
+	/* else { */
+	/* 	regs.ARM_pc = codeaddr; // just execute the 'shellcode' */
+	/* } */
 	
-	// detach and continue
-	ptrace(PTRACE_SETREGS, pid, 0, &regs);
+	/* // detach and continue */
+	/* ptrace(PTRACE_SETREGS, pid, 0, &regs); */
+
+	remote_dlopen(pid, arg, dlopenaddr, &regs, mprotectaddr);
+
 	ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
 
 	if (debug)
-		printf("library injection completed!\n");
+	  printf("library injection completed!\n");
 	
 	return 0;
 }
