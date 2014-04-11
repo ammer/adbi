@@ -21,6 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <asm/ptrace.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -31,6 +32,11 @@
 #include <errno.h>       
 #include <sys/mman.h>
 #include <assert.h>
+
+#if defined(__i386__)
+#include <asm/user_32.h>
+#define pt_regs    user_regs_struct
+#endif
 
 int debug = 0;
 int zygote = 0;
@@ -577,52 +583,46 @@ unsigned int sc[] = {
 };
 #endif
 
-#ifdef __arm__
-struct pt_regs2 {
-  long uregs[18];
-};
+#if defined(__arm__)
+/* struct pt_regs { */
+/*   long uregs[18]; */
+/* }; */
 
-#define ARM_cpsr        uregs[16]
-#define ARM_pc          uregs[15]
-#define ARM_lr          uregs[14]
-#define ARM_sp          uregs[13]
-#define ARM_ip          uregs[12]
-#define ARM_fp          uregs[11]
-#define ARM_r10         uregs[10]
-#define ARM_r9          uregs[9]
-#define ARM_r8          uregs[8]
-#define ARM_r7          uregs[7]
-#define ARM_r6          uregs[6]
-#define ARM_r5          uregs[5]
-#define ARM_r4          uregs[4]
-#define ARM_r3          uregs[3]
-#define ARM_r2          uregs[2]
-#define ARM_r1          uregs[1]
-#define ARM_r0          uregs[0]
-#define ARM_ORIG_r0     uregs[17]
+/* #define ARM_cpsr        uregs[16] */
+/* #define ARM_pc          uregs[15] */
+/* #define ARM_lr          uregs[14] */
+/* #define ARM_sp          uregs[13] */
+/* #define ARM_ip          uregs[12] */
+/* #define ARM_fp          uregs[11] */
+/* #define ARM_r10         uregs[10] */
+/* #define ARM_r9          uregs[9] */
+/* #define ARM_r8          uregs[8] */
+/* #define ARM_r7          uregs[7] */
+/* #define ARM_r6          uregs[6] */
+/* #define ARM_r5          uregs[5] */
+/* #define ARM_r4          uregs[4] */
+/* #define ARM_r3          uregs[3] */
+/* #define ARM_r2          uregs[2] */
+/* #define ARM_r1          uregs[1] */
+/* #define ARM_r0          uregs[0] */
+/* #define ARM_ORIG_r0     uregs[17] */
 
-struct pt_arm_regs {
-  long uregs[18];
-};
+/* struct pt_arm_regs { */
+/*   long uregs[18]; */
+/* }; */
 
 __asm__(
 	".section .data   \n"
 	".global arm_asm_end, arm_asm_start, stored_arm_regs, arm_libdl_path \n"
-
+	".code 32 \n"
 	"arm_asm_start:   \n"
-	//	" ldr r0, [pc, #(arm_libdl_path-arm_asm_start-8)]; " /* library filename */
 	" add r0, pc, #(arm_libdl_path-arm_asm_start-8); " /* library filename */
 	" mov r1, #0;       "	/* flag */
 	" mov lr, pc;       "	/* return address */
 	" ldr pc, [pc, #(arm_dlopen_addr-arm_asm_start-20)]; " /* dlopen address */
 
-	" ldr r0, [pc, #(stored_arm_regs-arm_asm_start-24)];"
-	" ldr r1, [pc, #(stored_arm_regs-arm_asm_start-24)];"
-	" ldr r2, [pc, #(stored_arm_regs-arm_asm_start-24)];"
-	" ldr r3, [pc, #(stored_arm_regs-arm_asm_start-24)];"
-	" ldr sp, [pc, #(stored_arm_regs-arm_asm_start-24)];"
-	" ldr lr, [pc, #(stored_arm_regs-arm_asm_start-24)];"
-	" ldr pc, [pc, #(stored_arm_regs-arm_asm_start-24)];"
+	" add r0, pc, #(stored_arm_regs-arm_asm_start-24);"
+	" ldm r0, {r0, r1, r2, r3, sp, lr, pc};"
 
 	"arm_dlopen_addr: \n"
 	" .int 0          \n"
@@ -636,10 +636,10 @@ __asm__(
 	"arm_asm_end:     \n"
 	);
 
-void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_arm_regs *regs, void *mprotectaddr) {
+void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_regs *regs, void *mprotectaddr) {
   extern void *arm_asm_start;
   extern void *arm_asm_end;
-  extern int  *stored_arm_regs;
+  extern long  stored_arm_regs;
   extern void *arm_libdl_path;
   extern void **arm_dlopen_addr;
   extern void *arm_libdl_path1;
@@ -649,7 +649,7 @@ void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_arm_re
 	   pid, libname, dlopen_addr, regs, mprotectaddr);
   }
 
-  int *r = &stored_arm_regs;
+  long *r = (long *)&stored_arm_regs;
   r[0] = regs->ARM_r0;
   r[1] = regs->ARM_r1;
   r[2] = regs->ARM_r2;
@@ -665,7 +665,7 @@ void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_arm_re
 
   // write code to stack
   int sc_size = &arm_asm_end-&arm_asm_start;
-  assert(sc_size == 147);
+  assert(sc_size == 142);
 
   void *codeaddr = regs->ARM_sp - (sc_size<<2);
   if (0 > write_mem(pid, (unsigned long*)&arm_asm_start, sc_size, codeaddr)) {
@@ -705,288 +705,406 @@ void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_arm_re
 
 }
 
-#endif	/* __arm__ */
+#elif defined(__i386__)
+
+__asm__(
+	".data   \n"
+	".global x86_asm_start, x86_asm_end, x86_call_dlopen_inst, x86_libdl_path, stored_x86_regs   \n"
+	"x86_asm_start:               \n"
+	" addl $12, %esp;             \n" /* params for mprotect */
+
+	" pushl $0;                   \n" /* param 2: flag */
+
+	" call p1;                    \n" /* need current ip again */
+	"p1:                          \n"
+	" popl %eax;                  \n"
+
+	" addl $(x86_libdl_path-p1), %eax; \n"	/* dlopen address  */
+	" pushl %eax;                 \n"
+
+	"x86_call_dlopen_inst:        \n"
+	" movl $0xffffeeee, %eax;     \n"	/* call dlopen, the address will be rewrite */
+	" call *%eax;                 \n"
+
+	" call p2;                    \n"
+	"p2:                          \n"
+	" popl %eax;                  \n"
+	" addl $(stored_x86_regs-p2), %eax;             \n"
+	" movl %eax, %esp;            \n"
+	" popl %eax;                  \n"
+	" popl %ebp;                  \n"
+	" popl %esp;                  \n"
+	" jmp  *%eax;                 \n"
+
+	"x86_libdl_path:   \n"
+	" .fill 512, 1, 0  \n"
+
+	".align 16         \n"
+	"stored_x86_regs:  \n"
+	" .fill 3, 4, 0   \n"
+	
+	".align 16         \n"
+	"x86_asm_end:     \n"
+	);
+
+void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_regs *regs, void *mprotectaddr) {
+  extern int x86_asm_start, x86_asm_end, x86_call_dlopen_inst, x86_libdl_path, stored_x86_regs;
+  void *x86_asm_start_ptr = &x86_asm_start;
+  void *x86_asm_end_ptr = &x86_asm_end;
+  char *x86_dlopen_addr = &((char *)&x86_call_dlopen_inst)[1]; /* call xxxx: e9 xx xx xx xx */
+  char *x86_libdl_path_ptr = &x86_libdl_path;
+  long *stored_x86_regs_ptr = &stored_x86_regs;
+
+  if(debug) 
+    printf("remote_dlopen(pid=%d, libname='%s', dlopen_addr=%p, regs=%p, mprotect=%p\n",
+	   pid, libname, dlopen_addr, regs, mprotectaddr);
+
+  /* save registers */
+  stored_x86_regs_ptr[0] = (long)regs->eip;
+  stored_x86_regs_ptr[1] = (long)regs->ebp;
+  stored_x86_regs_ptr[2] = (long)regs->esp;
+
+  /* library name */
+  strncpy(x86_libdl_path_ptr, libname, 512);
+  /* dlopen address */
+  memcpy(x86_dlopen_addr, &dlopen_addr, sizeof(void *));
+
+  int sc_size = (x86_asm_end_ptr - x86_asm_start_ptr)>>2;
+  printf("X86 shell code length = %d, esp: %p\n", sc_size, regs->esp);
+
+  void *codeaddr = regs->esp - (sc_size<<2);
+  if( 0 > write_mem(pid, x86_asm_start_ptr, sc_size, codeaddr)) {
+    printf("cannot write code, error!\n");
+    exit(1);
+  }
+
+  if (debug)
+    printf("executing injection code at 0x%x\n", codeaddr);
+
+  regs->esp = codeaddr;
+
+  if(debug) {
+    printf("Modify segment %p~%p to executable, injected code start address: %p\n", stack_start, stack_end, codeaddr);
+  }
+
+  regs->esp -= 4*sizeof(long);
+  long param[4] = {codeaddr, PROT_READ|PROT_WRITE|PROT_EXEC, stack_end-stack_start, stack_start};
+  if( 0 > write_mem(pid, param, (4*sizeof(long))>>2, regs->esp) ) {
+    printf("cannot write code for mprotect, error! esp: 0x%x\n", regs->esp);
+    exit(1);
+  }
+
+  if (debug)
+    printf("calling mprotect\n");
+
+  regs->eip = mprotectaddr;
+
+  ptrace(PTRACE_SETREGS, pid, 0, regs);
+}
+
+#elif defined(__mips__)
+
+__asm__(
+	//	".data      \n"
+	".global mips_asm_start, mips_asm_end    \n"
+	"mips_asm_start:                         \n"
+
+	"mips_asm_end:                           \n"
+	);
+
+void remote_dlopen(pid_t pid, char *libname, void *dlopen_addr, struct pt_regs *regs, void *mprotectaddr) {
+  
+}
+
+#endif	/* mips */
 
 #define HELPSTR "error usage: %s -p PID -l LIBNAME [-d (debug on)] [-z (zygote)] [-m (no mprotect)] [-s (appname)] [-Z (trace count)] [-D (debug level)]\n"
 
 int main(int argc, char *argv[])
 {
-	pid_t pid = 0;
-	struct pt_regs2 regs;
-	unsigned long dlopenaddr, mprotectaddr, codeaddr, libaddr;
-	unsigned long *p;
-	int fd = 0;
-	int n = 0;
-	char buf[32];
-	char *arg;
-	int opt;
-	char *appname = 0;
- 
- 	while ((opt = getopt(argc, argv, "p:l:dzms:Z:D:")) != -1) {
-		switch (opt) {
-			case 'p':
-				pid = strtol(optarg, NULL, 0);
-				break;
-			case 'Z':
-				zygote = strtol(optarg, NULL, 0);
-			break;
-			case 'D':
-				debug = strtol(optarg, NULL, 0);
-			break;
-			case 'l':
-				n = strlen(optarg)+1;
-				n = n/4 + (n%4 ? 1 : 0);
-				arg = malloc(n*sizeof(unsigned long));
-				memcpy(arg, optarg, n*4);
-				break;
-			case 'm':
-				nomprotect = 1;
-				break;
-			case 'd':
-				debug = 1;
-				break;
-			case 'z':
-				zygote = 1;
-				break;
-			case 's':
-				zygote = 1;
-				appname = strdup(optarg);
-				break;
-			default:
-				fprintf(stderr, HELPSTR, argv[0]);
-
-				exit(0);
-				break;
-		}
-	}
-
-	if (pid == 0 || n == 0) {
-		fprintf(stderr, HELPSTR, argv[0]);
-		exit(0);
-	}
-
-	if (!nomprotect) {
-		if (0 > find_name(pid, "mprotect", &mprotectaddr)) {
-			printf("can't find address of mprotect(), error!\n");
-			exit(1);
-		}
-		if (debug)
-			printf("mprotect: 0x%x\n", mprotectaddr);
-	}
-
-	void *ldl = dlopen("libdl.so", RTLD_LAZY);
-	if (ldl) {
-		dlopenaddr = dlsym(ldl, "dlopen");
-		dlclose(ldl);
-	}
-	unsigned long int lkaddr;
-	unsigned long int lkaddr2;
-	find_linker(getpid(), &lkaddr);
-	//printf("own linker: 0x%x\n", lkaddr);
-	//printf("offset %x\n", dlopenaddr - lkaddr);
-	find_linker(pid, &lkaddr2);
-	//printf("tgt linker: %x\n", lkaddr2);
-	//printf("tgt dlopen : %x\n", lkaddr2 + (dlopenaddr - lkaddr));
-	dlopenaddr = lkaddr2 + (dlopenaddr - lkaddr);
-	if (debug)
-		printf("dlopen: 0x%x\n", dlopenaddr);
-
-	// Attach 
-	if (0 > ptrace(PTRACE_ATTACH, pid, 0, 0)) {
-		printf("cannot attach to %d, error!\n", pid);
-		exit(1);
-	}
-	waitpid(pid, NULL, 0);
-	
-	if (appname) {	
-		if (ptrace(PTRACE_SETOPTIONS, pid, (void*)1, (void*)(PTRACE_O_TRACEFORK))) {
-			printf("FATAL ERROR: ptrace(PTRACE_SETOPTIONS, ...)");
-			return -1;
-		}
-		ptrace(PTRACE_CONT, pid, (void*)1, 0);
-
-		int t;
-		int stat;
-		int child_pid = 0;
-		for (;;) {
-			t = waitpid(-1, &stat, __WALL|WUNTRACED);
-
-			if (t != 0 && t == child_pid) {
-				if (debug > 1)
-					printf(".");
-				char fname[256];
-				sprintf(fname, "/proc/%d/cmdline", child_pid);
-				int fp = open(fname, O_RDONLY);
-				if (fp < 0) {
-					ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
-					continue;
-				}
-				read(fp, fname, sizeof(fname));
-				close(fp);
-
-				if (strcmp(fname, appname) == 0) {
-					if (debug)
-						printf("zygote -> %s\n", fname);
-
-					// detach from zygote
-					ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
-
-					// now perform on new process
-					pid = child_pid;
-					break;
-				}
-				else {
-					ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
-					continue;
-				}
-			}
-
-			if (WIFSTOPPED(stat) && (WSTOPSIG(stat) == SIGTRAP)) {
-				if ((stat >> 16) & PTRACE_EVENT_FORK) {
-					if (debug > 1)
-						printf("fork\n");
-					int b = t; // save parent pid
-					ptrace(PTRACE_GETEVENTMSG, t, 0, &child_pid);
-					if (debug)
-						printf("PID=%d  child=%d\n", t, child_pid);
-					t = child_pid;
-					
-					if (debug > 1)
-						printf("continue parent (zygote) PID=%d\n", b);
-					ptrace(PTRACE_CONT, b, (void*)1, 0);
-
-					ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
-				}
-			}
-		}
-	}
-
-	if (zygote) {
-		int i = 0;
-		for (i = 0; i < zygote; i++) {
-			// -- zygote fix ---
-			// we have to wait until the syscall is completed, IMPORTANT!
-			ptrace(PTRACE_SYSCALL, pid, 0, 0);
-			if (debug > 1)
-				printf("/");
-			waitpid(pid, NULL, 0);
-
-			ptrace(PTRACE_GETREGS, pid, 0, &regs);	
-			if (regs.ARM_ip != 0) {
-				if (debug > 1)
-					printf("not a syscall entry, wait for entry\n");
-				ptrace(PTRACE_SYSCALL, pid, 0, 0);
-				waitpid(pid, NULL, 0);
-			}
-
-			//if (debug)
-			//	printf("process mode: currently waiting in SYSCALL\n");
-			ptrace(PTRACE_SYSCALL, pid, 0, 0);
-			if (debug > 1)
-				printf("\\");
-			waitpid(pid, NULL, 0);
-			//if (debug)
-			//	printf("process mode: SYSCALL completed now inject\n");
-			// ---- need to work with zygote --- end ---
-		}
-	}
+  pid_t pid = 0;
+  struct pt_regs regs;
+  unsigned long dlopenaddr, mprotectaddr, codeaddr, libaddr;
+  unsigned long *p;
+  int fd = 0;
+  int n = 0;
+  char buf[32];
+  char *arg;
+  int opt;
+  char *appname = 0;
+  
+  while ((opt = getopt(argc, argv, "p:l:dzms:Z:D:")) != -1) {
+    switch (opt) {
+    case 'p':
+      pid = strtol(optarg, NULL, 0);
+      break;
+    case 'Z':
+      zygote = strtol(optarg, NULL, 0);
+      break;
+    case 'D':
+      debug = strtol(optarg, NULL, 0);
+      break;
+    case 'l':
+      n = strlen(optarg)+1;
+      n = n/4 + (n%4 ? 1 : 0);
+      arg = malloc(n*sizeof(unsigned long));
+      memcpy(arg, optarg, n*4);
+      break;
+    case 'm':
+      nomprotect = 1;
+      break;
+    case 'd':
+      debug = 1;
+      break;
+    case 'z':
+      zygote = 1;
+      break;
+    case 's':
+      zygote = 1;
+      appname = strdup(optarg);
+      break;
+    default:
+      fprintf(stderr, HELPSTR, argv[0]);
+      
+      exit(0);
+      break;
+    }
+  }
+  
+  if (pid == 0 || n == 0) {
+    fprintf(stderr, HELPSTR, argv[0]);
+    exit(0);
+  }
+  
+  if (!nomprotect) {
+    if (0 > find_name(pid, "mprotect", &mprotectaddr)) {
+      printf("can't find address of mprotect(), error!\n");
+      exit(1);
+    }
+    if (debug)
+      printf("mprotect: 0x%x\n", mprotectaddr);
+  }
+  
+  void *ldl = dlopen("libdl.so", RTLD_LAZY);
+  if (ldl) {
+    dlopenaddr = dlsym(ldl, "dlopen");
+    dlclose(ldl);
+  }
+  unsigned long int lkaddr;
+  unsigned long int lkaddr2;
+  find_linker(getpid(), &lkaddr);
+  //printf("own linker: 0x%x\n", lkaddr);
+  //printf("offset %x\n", dlopenaddr - lkaddr);
+  find_linker(pid, &lkaddr2);
+  //printf("tgt linker: %x\n", lkaddr2);
+  //printf("tgt dlopen : %x\n", lkaddr2 + (dlopenaddr - lkaddr));
+  dlopenaddr = lkaddr2 + (dlopenaddr - lkaddr);
+  if (debug)
+    printf("dlopen: 0x%x\n", dlopenaddr);
+  
+  // Attach 
+  if (0 > ptrace(PTRACE_ATTACH, pid, 0, 0)) {
+    printf("cannot attach to %d, error!\n", pid);
+    exit(1);
+  }
+  waitpid(pid, NULL, 0);
+  
+  if (appname) {	
+    if (ptrace(PTRACE_SETOPTIONS, pid, (void*)1, (void*)(PTRACE_O_TRACEFORK))) {
+      printf("FATAL ERROR: ptrace(PTRACE_SETOPTIONS, ...)");
+      return -1;
+    }
+    ptrace(PTRACE_CONT, pid, (void*)1, 0);
+    
+    int t;
+    int stat;
+    int child_pid = 0;
+    for (;;) {
+      t = waitpid(-1, &stat, __WALL|WUNTRACED);
+      
+      if (t != 0 && t == child_pid) {
 	if (debug > 1)
-		printf("\n");
-
-	sprintf(buf, "/proc/%d/mem", pid);
-	fd = open(buf, O_WRONLY);
-	if (0 > fd) {
-		printf("cannot open %s, error!\n", buf);
-		exit(1);
+	  printf(".");
+	char fname[256];
+	sprintf(fname, "/proc/%d/cmdline", child_pid);
+	int fp = open(fname, O_RDONLY);
+	if (fp < 0) {
+	  ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
+	  continue;
 	}
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-
-	// setup variables of the loading and fixup code	
-	/*
-	sc[9] = regs.ARM_r0;
-	sc[10] = regs.ARM_r1;
-	sc[11] = regs.ARM_lr;
-	sc[12] = regs.ARM_pc;
-	sc[13] = regs.ARM_sp;
-	sc[15] = dlopenaddr;
-	*/
+	read(fp, fname, sizeof(fname));
+	close(fp);
 	
-	/* sc[11] = regs.ARM_r0; */
-	/* sc[12] = regs.ARM_r1; */
-	/* sc[13] = regs.ARM_r2; */
-	/* sc[14] = regs.ARM_r3; */
-	/* sc[15] = regs.ARM_lr; */
-	/* sc[16] = regs.ARM_pc; */
-	/* sc[17] = regs.ARM_sp; */
-	/* sc[19] = dlopenaddr; */
-		
-	/* if (debug) { */
-	/* 	printf("pc=%x lr=%x sp=%x fp=%x\n", regs.ARM_pc, regs.ARM_lr, regs.ARM_sp, regs.ARM_fp); */
-	/* 	printf("r0=%x r1=%x\n", regs.ARM_r0, regs.ARM_r1); */
-	/* 	printf("r2=%x r3=%x\n", regs.ARM_r2, regs.ARM_r3); */
-	/* } */
+	if (strcmp(fname, appname) == 0) {
+	  if (debug)
+	    printf("zygote -> %s\n", fname);
+	  
+	  // detach from zygote
+	  ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
+	  
+	  // now perform on new process
+	  pid = child_pid;
+	  break;
+	}
+	else {
+	  ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
+	  continue;
+	}
+      }
+      
+      if (WIFSTOPPED(stat) && (WSTOPSIG(stat) == SIGTRAP)) {
+	if ((stat >> 16) & PTRACE_EVENT_FORK) {
+	  if (debug > 1)
+	    printf("fork\n");
+	  int b = t; // save parent pid
+	  ptrace(PTRACE_GETEVENTMSG, t, 0, &child_pid);
+	  if (debug)
+	    printf("PID=%d  child=%d\n", t, child_pid);
+	  t = child_pid;
+	  
+	  if (debug > 1)
+	    printf("continue parent (zygote) PID=%d\n", b);
+	  ptrace(PTRACE_CONT, b, (void*)1, 0);
+	  
+	  ptrace(PTRACE_SYSCALL, child_pid, 0, 0);
+	}
+      }
+    }
+  }
 
-	/* // push library name to stack */
-	/* libaddr = regs.ARM_sp - n*4 - sizeof(sc); */
-	/* sc[18] = libaddr;	 */
-	/* //sc[14] = libaddr; */
-	/* //printf("libaddr: %x\n", libaddr); */
+  if (zygote) {
+    int i = 0;
+    for (i = 0; i < zygote; i++) {
+      // -- zygote fix ---
+      // we have to wait until the syscall is completed, IMPORTANT!
+      ptrace(PTRACE_SYSCALL, pid, 0, 0);
+      if (debug > 1)
+	printf("/");
+      waitpid(pid, NULL, 0);
+      
+      ptrace(PTRACE_GETREGS, pid, 0, &regs);
+      /* if (regs.ARM_ip != 0) { */
+      /* 	if (debug > 1) */
+      /* 		printf("not a syscall entry, wait for entry\n"); */
+      /* 	ptrace(PTRACE_SYSCALL, pid, 0, 0); */
+      /* 	waitpid(pid, NULL, 0); */
+      /* } */
+      
+      if (debug)
+	printf("process mode: currently waiting in SYSCALL\n");
+      
+      ptrace(PTRACE_SYSCALL, pid, 0, 0);
+      if (debug > 1)
+	printf("\\");
+      waitpid(pid, NULL, 0);
+      if (debug)
+	printf("process mode: SYSCALL completed now inject\n");
+      // ---- need to work with zygote --- end ---
+    }
+  }
+  if (debug > 1)
+    printf("\n");
+  
+  sprintf(buf, "/proc/%d/mem", pid);
+  fd = open(buf, O_WRONLY);
+  if (0 > fd) {
+    printf("cannot open %s, error!\n", buf);
+    exit(1);
+  }
+  ptrace(PTRACE_GETREGS, pid, 0, &regs);
+  
+#if defined(__i386__)
+  printf("Get regs: esp: 0x%x, eip: 0x%x\n", regs.esp, regs.eip);
+#endif
 
-	/* if (stack_start == 0) { */
-	/* 	stack_start = (unsigned long int) strtol(argv[3], NULL, 16); */
-	/* 	stack_start = stack_start << 12; */
-	/* 	stack_end = stack_start + strtol(argv[4], NULL, 0); */
-	/* } */
-	/* if (debug) */
-	/* 	printf("stack: 0x%x-0x%x leng = %d\n", stack_start, stack_end, stack_end-stack_start); */
-	
-	/* // write library name to stack */
-	/* if (0 > write_mem(pid, (unsigned long*)arg, n, libaddr)) { */
-	/* 	printf("cannot write library name (%s) to stack, error!\n", arg); */
-	/* 	exit(1); */
-	/* } */
-	
-	/* // write code to stack */
-	/* codeaddr = regs.ARM_sp - sizeof(sc); */
-	/* if (0 > write_mem(pid, (unsigned long*)&sc, sizeof(sc)/sizeof(long), codeaddr)) { */
-	/* 	printf("cannot write code, error!\n"); */
-	/* 	exit(1); */
-	/* } */
-	
-	/* if (debug) */
-	/* 	printf("executing injection code at 0x%x\n", codeaddr); */
-
-	/* // calc stack pointer */
-	/* regs.ARM_sp = regs.ARM_sp - n*4 - sizeof(sc); */
-
-	/* // call mprotect() to make stack executable */
-	/* regs.ARM_r0 = stack_start; // want to make stack executable */
-	/* //printf("r0 %x\n", regs.ARM_r0); */
-	/* regs.ARM_r1 = stack_end - stack_start; // stack size */
-	/* //printf("mprotect(%x, %d, ALL)\n", regs.ARM_r0, regs.ARM_r1); */
-	/* regs.ARM_r2 = PROT_READ|PROT_WRITE|PROT_EXEC; // protections */
-
-	/* // normal mode, first call mprotect */
-	/* if (nomprotect == 0) { */
-	/* 	if (debug) */
-	/* 		printf("calling mprotect\n"); */
-	/* 	regs.ARM_lr = codeaddr; // points to loading and fixing code */
-	/* 	regs.ARM_pc = mprotectaddr; // execute mprotect() */
-	/* } */
-	/* // no need to execute mprotect on old Android versions */
-	/* else { */
-	/* 	regs.ARM_pc = codeaddr; // just execute the 'shellcode' */
-	/* } */
-	
-	/* // detach and continue */
-	/* ptrace(PTRACE_SETREGS, pid, 0, &regs); */
-
-	remote_dlopen(pid, arg, dlopenaddr, &regs, mprotectaddr);
-
-	ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
-
-	if (debug)
-	  printf("library injection completed!\n");
-	
-	return 0;
+  // setup variables of the loading and fixup code	
+  /*
+    sc[9] = regs.ARM_r0;
+    sc[10] = regs.ARM_r1;
+    sc[11] = regs.ARM_lr;
+    sc[12] = regs.ARM_pc;
+    sc[13] = regs.ARM_sp;
+    sc[15] = dlopenaddr;
+  */
+  
+  /* sc[11] = regs.ARM_r0; */
+  /* sc[12] = regs.ARM_r1; */
+  /* sc[13] = regs.ARM_r2; */
+  /* sc[14] = regs.ARM_r3; */
+  /* sc[15] = regs.ARM_lr; */
+  /* sc[16] = regs.ARM_pc; */
+  /* sc[17] = regs.ARM_sp; */
+  /* sc[19] = dlopenaddr; */
+  
+  /* if (debug) { */
+  /* 	printf("pc=%x lr=%x sp=%x fp=%x\n", regs.ARM_pc, regs.ARM_lr, regs.ARM_sp, regs.ARM_fp); */
+  /* 	printf("r0=%x r1=%x\n", regs.ARM_r0, regs.ARM_r1); */
+  /* 	printf("r2=%x r3=%x\n", regs.ARM_r2, regs.ARM_r3); */
+  /* } */
+  
+  /* // push library name to stack */
+  /* libaddr = regs.ARM_sp - n*4 - sizeof(sc); */
+  /* sc[18] = libaddr;	 */
+  /* //sc[14] = libaddr; */
+  /* //printf("libaddr: %x\n", libaddr); */
+  
+  /* if (stack_start == 0) { */
+  /* 	stack_start = (unsigned long int) strtol(argv[3], NULL, 16); */
+  /* 	stack_start = stack_start << 12; */
+  /* 	stack_end = stack_start + strtol(argv[4], NULL, 0); */
+  /* } */
+  /* if (debug) */
+  /* 	printf("stack: 0x%x-0x%x leng = %d\n", stack_start, stack_end, stack_end-stack_start); */
+  
+  /* // write library name to stack */
+  /* if (0 > write_mem(pid, (unsigned long*)arg, n, libaddr)) { */
+  /* 	printf("cannot write library name (%s) to stack, error!\n", arg); */
+  /* 	exit(1); */
+  /* } */
+  
+  /* // write code to stack */
+  /* codeaddr = regs.ARM_sp - sizeof(sc); */
+  /* if (0 > write_mem(pid, (unsigned long*)&sc, sizeof(sc)/sizeof(long), codeaddr)) { */
+  /* 	printf("cannot write code, error!\n"); */
+  /* 	exit(1); */
+  /* } */
+  
+  /* if (debug) */
+  /* 	printf("executing injection code at 0x%x\n", codeaddr); */
+  
+  /* // calc stack pointer */
+  /* regs.ARM_sp = regs.ARM_sp - n*4 - sizeof(sc); */
+  
+  /* // call mprotect() to make stack executable */
+  /* regs.ARM_r0 = stack_start; // want to make stack executable */
+  /* //printf("r0 %x\n", regs.ARM_r0); */
+  /* regs.ARM_r1 = stack_end - stack_start; // stack size */
+  /* //printf("mprotect(%x, %d, ALL)\n", regs.ARM_r0, regs.ARM_r1); */
+  /* regs.ARM_r2 = PROT_READ|PROT_WRITE|PROT_EXEC; // protections */
+  
+  /* // normal mode, first call mprotect */
+  /* if (nomprotect == 0) { */
+  /* 	if (debug) */
+  /* 		printf("calling mprotect\n"); */
+  /* 	regs.ARM_lr = codeaddr; // points to loading and fixing code */
+  /* 	regs.ARM_pc = mprotectaddr; // execute mprotect() */
+  /* } */
+  /* // no need to execute mprotect on old Android versions */
+  /* else { */
+  /* 	regs.ARM_pc = codeaddr; // just execute the 'shellcode' */
+  /* } */
+  
+  /* // detach and continue */
+  /* ptrace(PTRACE_SETREGS, pid, 0, &regs); */
+  
+  remote_dlopen(pid, arg, dlopenaddr, &regs, mprotectaddr);
+  
+  ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
+  
+  if (debug)
+    printf("library injection completed!\n");
+  
+  return 0;
 }
+
+
